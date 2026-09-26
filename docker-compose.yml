@@ -1,0 +1,279 @@
+# =============================================================================
+# docker-compose.yml
+# IoT Sensor Data Pipeline – Apache Airflow + PostgreSQL
+# =============================================================================
+# Services:
+#   postgres            – Airflow metadata database  (port 5432, internal only)
+#   data-warehouse-db   – IoT sensor data warehouse   (port 5433 → 5432)
+#   redis               – Celery result backend / broker
+#   airflow-webserver   – Airflow web UI              (port 8080)
+#   airflow-scheduler   – DAG scheduler
+#   airflow-worker      – Celery worker
+#   airflow-triggerer   – Deferred operator triggerer
+#   airflow-init        – One-shot initialisation container
+# =============================================================================
+
+version: "3.8"
+
+# ---------------------------------------------------------------------------
+# Common Airflow configuration (YAML anchor)
+# ---------------------------------------------------------------------------
+x-airflow-common: &airflow-common
+  image: ${AIRFLOW_IMAGE_NAME:-apache/airflow:2.7.2-python3.9}
+  environment: &airflow-common-env
+    AIRFLOW__CORE__EXECUTOR: CeleryExecutor
+    AIRFLOW__DATABASE__SQL_ALCHEMY_CONN: postgresql+psycopg2://${POSTGRES_USER:-airflow}:${POSTGRES_PASSWORD:-airflow}@postgres/airflow
+    AIRFLOW__CELERY__RESULT_BACKEND: db+postgresql://${POSTGRES_USER:-airflow}:${POSTGRES_PASSWORD:-airflow}@postgres/airflow
+    AIRFLOW__CELERY__BROKER_URL: redis://:@redis:6379/0
+    AIRFLOW__CORE__FERNET_KEY: ${AIRFLOW__CORE__FERNET_KEY:-}
+    AIRFLOW__CORE__DAGS_ARE_PAUSED_AT_CREATION: "true"
+    AIRFLOW__CORE__LOAD_EXAMPLES: "false"
+    AIRFLOW__API__AUTH_BACKENDS: airflow.api.auth.backend.basic_auth,airflow.api.auth.backend.session
+    AIRFLOW__SCHEDULER__ENABLE_HEALTH_CHECK: "true"
+    # Data-warehouse connection (registered as Airflow Connection)
+    AIRFLOW_CONN_DATA_WAREHOUSE_POSTGRES: postgresql://${DW_USER:-airflow}:${DW_PASSWORD:-airflow}@data-warehouse-db:5432/${DW_DB:-iot_sensors}
+    # Pass DW credentials through for fallback env-var auth
+    DW_HOST: data-warehouse-db
+    DW_PORT: "5432"
+    DW_DB: ${DW_DB:-iot_sensors}
+    DW_USER: ${DW_USER:-airflow}
+    DW_PASSWORD: ${DW_PASSWORD:-airflow}
+    DW_CONN_ID: data_warehouse_postgres
+    SENSOR_BATCH_SIZE: "250"
+    _PIP_ADDITIONAL_REQUIREMENTS: "pandas==2.1.4 numpy==1.26.4 psycopg2-binary==2.9.9 SQLAlchemy==1.4.53 python-dotenv==1.0.0 cryptography==41.0.7"
+  volumes:
+    - ./dags:/opt/airflow/dags
+    - ./logs:/opt/airflow/logs
+    - ./plugins:/opt/airflow/plugins
+    - ./scripts:/opt/airflow/scripts
+    - ./data:/opt/airflow/data
+    - ./config:/opt/airflow/config
+  user: "${AIRFLOW_UID:-50000}:0"
+  depends_on: &airflow-common-depends-on
+    redis:
+      condition: service_healthy
+    postgres:
+      condition: service_healthy
+
+
+services:
+  # ---------------------------------------------------------------------------
+  # Airflow metadata PostgreSQL database
+  # ---------------------------------------------------------------------------
+  postgres:
+    image: postgres:13
+    container_name: airflow_metadata_db
+    environment:
+      POSTGRES_USER: ${POSTGRES_USER:-airflow}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-airflow}
+      POSTGRES_DB: airflow
+    volumes:
+      - postgres-db-volume:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD", "pg_isready", "-U", "${POSTGRES_USER:-airflow}"]
+      interval: 10s
+      retries: 5
+      start_period: 5s
+    restart: always
+
+  # ---------------------------------------------------------------------------
+  # IoT Sensor Data Warehouse PostgreSQL database
+  # ---------------------------------------------------------------------------
+  data-warehouse-db:
+    image: postgres:13
+    container_name: data_warehouse_db
+    environment:
+      POSTGRES_USER: ${DW_USER:-airflow}
+      POSTGRES_PASSWORD: ${DW_PASSWORD:-airflow}
+      POSTGRES_DB: ${DW_DB:-iot_sensors}
+    ports:
+      - "5433:5432"           # Exposed on host port 5433 to avoid conflict
+    volumes:
+      - ./config/database_schema.sql:/docker-entrypoint-initdb.d/init.sql:ro
+      - data-warehouse-data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD", "pg_isready", "-U", "${DW_USER:-airflow}", "-d", "${DW_DB:-iot_sensors}"]
+      interval: 10s
+      retries: 5
+      start_period: 10s
+    restart: always
+
+  # ---------------------------------------------------------------------------
+  # Redis (Celery broker)
+  # ---------------------------------------------------------------------------
+  redis:
+    image: redis:7.2-bookworm
+    container_name: airflow_redis
+    expose:
+      - 6379
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 10s
+      timeout: 30s
+      retries: 50
+      start_period: 30s
+    restart: always
+
+  # ---------------------------------------------------------------------------
+  # Airflow Webserver
+  # ---------------------------------------------------------------------------
+  airflow-webserver:
+    <<: *airflow-common
+    container_name: airflow_webserver
+    command: webserver
+    ports:
+      - "8080:8080"
+    healthcheck:
+      test: ["CMD", "curl", "--fail", "http://localhost:8080/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 5
+      start_period: 30s
+    restart: always
+    depends_on:
+      <<: *airflow-common-depends-on
+      airflow-init:
+        condition: service_completed_successfully
+
+  # ---------------------------------------------------------------------------
+  # Airflow Scheduler
+  # ---------------------------------------------------------------------------
+  airflow-scheduler:
+    <<: *airflow-common
+    container_name: airflow_scheduler
+    command: scheduler
+    healthcheck:
+      test: ["CMD", "curl", "--fail", "http://localhost:8974/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 5
+      start_period: 30s
+    restart: always
+    depends_on:
+      <<: *airflow-common-depends-on
+      airflow-init:
+        condition: service_completed_successfully
+
+  # ---------------------------------------------------------------------------
+  # Airflow Celery Worker
+  # ---------------------------------------------------------------------------
+  airflow-worker:
+    <<: *airflow-common
+    container_name: airflow_worker
+    command: celery worker
+    healthcheck:
+      test:
+        - "CMD-SHELL"
+        - 'celery --app airflow.executors.celery_executor.app inspect ping -d "celery@$${HOSTNAME}" -t 10'
+      interval: 30s
+      timeout: 10s
+      retries: 5
+      start_period: 30s
+    environment:
+      <<: *airflow-common-env
+      DUMB_INIT_SETSID: "0"
+    restart: always
+    depends_on:
+      <<: *airflow-common-depends-on
+      airflow-init:
+        condition: service_completed_successfully
+
+  # ---------------------------------------------------------------------------
+  # Airflow Triggerer (deferred operators support)
+  # ---------------------------------------------------------------------------
+  airflow-triggerer:
+    <<: *airflow-common
+    container_name: airflow_triggerer
+    command: triggerer
+    healthcheck:
+      test: ["CMD-SHELL", 'airflow jobs check --job-type TriggererJob --hostname "$${HOSTNAME}"']
+      interval: 30s
+      timeout: 10s
+      retries: 5
+      start_period: 30s
+    restart: always
+    depends_on:
+      <<: *airflow-common-depends-on
+      airflow-init:
+        condition: service_completed_successfully
+
+  # ---------------------------------------------------------------------------
+  # One-shot Airflow initialisation container
+  # ---------------------------------------------------------------------------
+  airflow-init:
+    <<: *airflow-common
+    container_name: airflow_init
+    entrypoint: /bin/bash
+    command:
+      - -c
+      - |
+        function ver() {
+          printf "%04d%04d%04d%04d" $${1//./ }
+        }
+        airflow_version=$$(AIRFLOW__LOGGING__LOGGING_LEVEL=INFO && gosu airflow airflow version)
+        airflow_version_comparable=$$(ver $${airflow_version})
+        min_airflow_version=2.2.0
+        min_airflow_version_comparable=$$(ver $${min_airflow_version})
+        if (( airflow_version_comparable < min_airflow_version_comparable )); then
+          echo "Airflow version $${airflow_version} too old. Minimum is $${min_airflow_version}."
+          exit 1
+        fi
+        if [[ -z "${AIRFLOW_UID}" ]]; then
+          echo "AIRFLOW_UID not set. Defaulting to 50000."
+        fi
+        one_meg=1048576
+        mem_available=$$(($$(getconf _PHYS_PAGES) * $$(getconf PAGE_SIZE) / one_meg))
+        cpus_available=$$(grep -cE 'cpu[0-9]+' /proc/stat)
+        disk_available=$$(df / | tail -1 | awk '{print $4}')
+        warning_resources="false"
+        if (( mem_available < 4000 )) ; then
+          echo "WARNING: Not enough memory available for Docker. At least 4GB is recommended."
+          warning_resources="true"
+        fi
+        if (( cpus_available < 2 )); then
+          echo "WARNING: Not enough CPUS available for Docker. At least 2 CPUs are recommended."
+          warning_resources="true"
+        fi
+        if (( disk_available < one_meg * 10 )); then
+          echo "WARNING: Not enough disk available for Docker. At least 10GB is recommended."
+          warning_resources="true"
+        fi
+        if [[ $${warning_resources} == "true" ]]; then
+          echo "WARNING: Resource constraints detected."
+        fi
+        mkdir -p /sources/logs /sources/dags /sources/plugins /sources/data /sources/scripts
+        chown -R "${AIRFLOW_UID}:0" /sources/{logs,dags,plugins,data,scripts}
+        exec /entrypoint airflow version
+    environment:
+      <<: *airflow-common-env
+      _AIRFLOW_DB_UPGRADE: "true"
+      _AIRFLOW_WWW_USER_CREATE: "true"
+      _AIRFLOW_WWW_USER_USERNAME: ${_AIRFLOW_WWW_USER_USERNAME:-airflow}
+      _AIRFLOW_WWW_USER_PASSWORD: ${_AIRFLOW_WWW_USER_PASSWORD:-airflow}
+    user: "0:0"
+    volumes:
+      - .:/sources
+
+  # ---------------------------------------------------------------------------
+  # Airflow CLI helper (docker compose run airflow-cli airflow <cmd>)
+  # ---------------------------------------------------------------------------
+  airflow-cli:
+    <<: *airflow-common
+    container_name: airflow_cli
+    profiles:
+      - debug
+    environment:
+      <<: *airflow-common-env
+      CONNECTION_CHECK_MAX_COUNT: "0"
+    command:
+      - bash
+      - -c
+      - airflow
+
+
+# ---------------------------------------------------------------------------
+# Named volumes
+# ---------------------------------------------------------------------------
+volumes:
+  postgres-db-volume:
+  data-warehouse-data:

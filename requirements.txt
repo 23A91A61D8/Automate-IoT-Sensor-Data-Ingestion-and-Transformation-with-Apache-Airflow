@@ -1,0 +1,30 @@
+# =============================================================================
+# requirements.txt
+# Python dependencies for the IoT Sensor Data Pipeline project.
+# Compatible with Apache Airflow 2.7.2 / Python 3.9.
+# =============================================================================
+
+# --- Core data manipulation ---
+pandas==2.1.4
+numpy==1.26.4
+
+# --- Database connectivity ---
+psycopg2-binary==2.9.9          # PostgreSQL adapter (binary wheel for easy install)
+SQLAlchemy==1.4.53              # Airflow 2.7.x requires SQLAlchemy < 2.0
+
+# --- Apache Airflow ---
+# NOTE: When using the official Docker image, Airflow itself is already
+# installed. These extras add optional providers used by the pipeline.
+apache-airflow-providers-postgres==5.7.1
+apache-airflow-providers-celery==3.4.0
+
+# --- Testing ---
+pytest==7.4.4
+pytest-cov==4.1.0               # Coverage reporting
+pytest-mock==3.12.0             # Mocking utilities
+
+# --- Security (Fernet key encryption) ---
+cryptography==41.0.7            # Required for AIRFLOW__CORE__FERNET_KEY generation
+
+# --- Utilities ---
+python-dotenv==1.0.0            # Load .env files in local development
